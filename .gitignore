@@ -1,0 +1,13 @@
+# ROS 2 workspace build folders
+build/
+install/
+log/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Video cache
+*.mp4
+*.avi
