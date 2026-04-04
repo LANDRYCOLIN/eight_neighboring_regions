@@ -168,8 +168,8 @@ private:
             // 【新增】默认框是绿色 (B, G, R)
             cv::Scalar box_color(0, 255, 0); 
 
-            // 遇到路口倾向右转
-            if (branches >= 3) {
+           // 遇到路口倾向右转 (加入 i > 0 屏蔽底部边界误检)
+            if (branches >= 3 && i > 1) {
                 cv::Mat weighted_roi;
                 window_roi.convertTo(weighted_roi, CV_32F);
 
@@ -177,17 +177,18 @@ private:
                 for (int j = 0; j < 8; ++j) {
                     int x_start = j * strip_w;
                     int x_end = (j == 7) ? window_roi.cols : (j + 1) * strip_w;
-        
+                    
                     // 应用权重：将该区域像素值乘以对应的权重系数
                     cv::Mat strip = weighted_roi.colRange(x_start, x_end);
                     strip *= region_weights_[j];
                 }
 
-    // 使用加权后的图像重新计算质心
-    M = cv::moments(weighted_roi, false); 
-    
-    is_junction = true;
-    box_color = cv::Scalar(0, 0, 255);
+                // 使用加权后的图像重新计算质心
+                M = cv::moments(weighted_roi, false); 
+                
+                // 标记为路口并变红
+                is_junction = true;                
+                box_color = cv::Scalar(0, 0, 255); 
             }
 
             if (M.m00 > 0) {

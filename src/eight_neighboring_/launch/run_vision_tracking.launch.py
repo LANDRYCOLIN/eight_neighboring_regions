@@ -39,7 +39,7 @@ def generate_launch_description():
             'auto_thresh_max': 225, # 在强光直射下的最高阈值
             
             # --- 降噪与保边 ---
-            'blur_ksize': 5,
+            'blur_ksize': 9,
             'bilateral_d': 0,       # 设为大于0开启双边滤波，专治地板反光纹理
             
             # --- 形态学流水线 ---
