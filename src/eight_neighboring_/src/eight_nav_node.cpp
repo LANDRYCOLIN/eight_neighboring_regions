@@ -43,7 +43,8 @@ public:
         // ==========================================
         window_width_  = declare_parameter<int>("window_width", 160); 
         window_height_ = declare_parameter<int>("window_height", 40); 
-        num_windows_   = declare_parameter<int>("num_windows", 4);  
+        num_windows_   = declare_parameter<int>("num_windows", 4); 
+        region_weights_ = declare_parameter<std::vector<double>>("region_weights", {0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0}); // 默认左四为0，右四为1 
         
         show_fps_overlay_ = declare_parameter<bool>("show_fps_overlay", true);
         fps_ema_alpha_    = declare_parameter<double>("fps_ema_alpha", 0.2);
@@ -169,12 +170,24 @@ private:
 
             // 遇到路口倾向右转
             if (branches >= 3) {
-                window_roi.colRange(0, window_roi.cols / 2).setTo(0);
-                M = cv::moments(window_roi, true); 
-                
-                // 【核心显性修改】
-                is_junction = true;                // 标记发现了路口
-                box_color = cv::Scalar(0, 0, 255); // 框变成红色！(报警提示)
+                cv::Mat weighted_roi;
+                window_roi.convertTo(weighted_roi, CV_32F);
+
+                int strip_w = window_roi.cols / 8;
+                for (int j = 0; j < 8; ++j) {
+                    int x_start = j * strip_w;
+                    int x_end = (j == 7) ? window_roi.cols : (j + 1) * strip_w;
+        
+                    // 应用权重：将该区域像素值乘以对应的权重系数
+                    cv::Mat strip = weighted_roi.colRange(x_start, x_end);
+                    strip *= region_weights_[j];
+                }
+
+    // 使用加权后的图像重新计算质心
+    M = cv::moments(weighted_roi, false); 
+    
+    is_junction = true;
+    box_color = cv::Scalar(0, 0, 255);
             }
 
             if (M.m00 > 0) {
@@ -292,6 +305,7 @@ private:
     }
 
     std::string image_topic_, corner_topic_, debug_topic_, binary_topic_;
+    std::vector<double> region_weights_;
     double roi_ratio_, auto_thresh_k_;
     bool auto_threshold_;
     int threshold_, auto_thresh_min_, auto_thresh_max_;
