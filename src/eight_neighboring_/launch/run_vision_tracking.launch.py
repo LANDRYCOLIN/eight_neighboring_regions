@@ -30,32 +30,32 @@ def generate_launch_description():
         name='eight_nav_node',
         output='screen',
         parameters=[{
-            'roi_ratio': 0.6,
+            'roi_ratio': 0.5,
             
             # --- 阈值与上下限截断 ---
             'auto_threshold': True,
-            'auto_thresh_k': 0.8,
+            'auto_thresh_k': 0.85,
             'auto_thresh_min': 165, # 在暗光死角的绝对兜底线
             'auto_thresh_max': 225, # 在强光直射下的最高阈值
             
             # --- 降噪与保边 ---
-            'blur_ksize': 9,
+            'blur_ksize': 7,
             'bilateral_d': 0,       # 设为大于0开启双边滤波，专治地板反光纹理
             
             # --- 形态学流水线 ---
-            'morph_ksize': 5,       # 第一刀：抹掉微小星点
-            'close_ksize': 11,       # 第二刀：补齐光斑导致的线段断裂
+            'morph_ksize': 7,       # 第一刀：抹掉微小星点
+            'close_ksize': 13,       # 第二刀：补齐光斑导致的线段断裂
             'open_ksize': 7,        # 第三刀：刮平多余毛刺
             
             # --- 边缘物理遮挡 ---
-            'border_margin_px': 20,  # 设为 20 即可把赛道边缘杂物物理抹黑
+            'border_margin_px': 25,  # 设为 20 即可把赛道边缘杂物物理抹黑
             
             # --- 其他 ---
             'window_width': 360,    # 足够宽，包住白线
-            'window_height': 40,    # 足够薄，应对弯道
+            'window_height': 35,    # 足够薄，应对弯道
             'num_windows': 6,
             'local_debug_display': True,
-            'region_weights': [0.0, 0.0, 0.0, 0.0, 1.5, 1.0, 1.0, 1.0]
+            'region_weights': [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.2, 1.5]
         }]
     )
 
