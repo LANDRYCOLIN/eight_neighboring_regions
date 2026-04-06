@@ -34,7 +34,7 @@ def generate_launch_description():
             
             # --- 阈值与上下限截断 ---
             'auto_threshold': True,
-            'auto_thresh_k': 0.85,
+            'auto_thresh_k': 1.0,
             'auto_thresh_min': 165, # 在暗光死角的绝对兜底线
             'auto_thresh_max': 225, # 在强光直射下的最高阈值
             

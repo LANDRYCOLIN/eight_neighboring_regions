@@ -24,7 +24,7 @@ public:
         roi_ratio_       = declare_parameter<double>("roi_ratio", 0.6); 
         auto_threshold_  = declare_parameter<bool>("auto_threshold", true);
         threshold_       = declare_parameter<int>("threshold", 210);
-        auto_thresh_k_   = declare_parameter<double>("auto_thresh_k", 0.6);
+        auto_thresh_k_   = declare_parameter<double>("auto_thresh_k", 0.6); // 建议在 launch 中改为 0.85 滤除光斑
         auto_thresh_min_ = declare_parameter<int>("auto_thresh_min", 160);
         auto_thresh_max_ = declare_parameter<int>("auto_thresh_max", 235);
         
@@ -60,7 +60,7 @@ public:
             image_topic_, rclcpp::SensorDataQoS(),
             std::bind(&EightNavNode::onImage, this, std::placeholders::_1));
 
-        RCLCPP_INFO(get_logger(), "八邻域摩尔追踪启动！(加入光斑滤除与岔路识别逻辑)");
+        RCLCPP_INFO(get_logger(), "八邻域摩尔追踪：加入光斑垂直跨度过滤与完美 L/T 区分机制！");
     }
 
 private:
@@ -130,7 +130,6 @@ private:
         // 【核心：八邻域 Moore 边界追踪】
         // ==========================================
         
-        // 1. 全局视野死胡同初判
         int total_white_pixels = cv::countNonZero(binary);
         double global_white_ratio = (double)total_white_pixels / (roi_rect.area());
         bool is_dead_end = (global_white_ratio < 0.015); 
@@ -152,7 +151,6 @@ private:
         int current_y = roi_h / 2; 
 
         if (!is_dead_end) {
-            // 2. 寻找左右边界种子
             cv::Point left_seed = center_seed;
             while(left_seed.x > 0 && binary.at<uchar>(left_seed.y, left_seed.x - 1) > 0) left_seed.x--;
             
@@ -161,17 +159,23 @@ private:
             
             int base_width = std::max(20, right_seed.x - left_seed.x);
 
-            // 3. 蚂蚁出动
             std::vector<cv::Point> left_edge = traceBoundary(binary, left_seed, 4, true);
             std::vector<cv::Point> right_edge = traceBoundary(binary, right_seed, 0, false);
 
-            // 【问题3修复】：如果蚂蚁很快就无路可走（总步数太少），说明它是地面的反光孤岛！
-            if (left_edge.size() + right_edge.size() < 80) {
+            // 【抗光斑强化】：计算轮廓的垂直高度跨度 (Vertical Span)
+            int min_y = roi_h;
+            for(const auto& p : left_edge) min_y = std::min(min_y, p.y);
+            for(const auto& p : right_edge) min_y = std::min(min_y, p.y);
+            int vertical_span = center_seed.y - min_y;
+
+            // 真正的赛道一定会向上延伸很长。如果垂直跨度小于 ROI 高度的 30%（比如是个圆圈光斑），直接干掉！
+            if (left_edge.size() + right_edge.size() < 80 || vertical_span < roi_h * 0.30) {
                 is_dead_end = true;
             } else {
-                // 4. 分析蚂蚁轨迹
                 int min_left_x = w;
                 int max_right_x = 0;
+                int max_track_width = 0;
+                
                 std::vector<int> left_b(roi_h, w - 1); 
                 std::vector<int> right_b(roi_h, 0);    
                 
@@ -186,13 +190,18 @@ private:
                     cv::circle(debug_vis, cv::Point(p.x, p.y + roi_y), 2, cv::Scalar(255, 0, 0), -1); 
                 }
 
-                // 【问题1修复】：基于起步点的双向展宽判定（完美区分 L 和 T）
-                int ext_left = center_seed.x - min_left_x;
-                int ext_right = max_right_x - center_seed.x;
-                // 只有当向左和向右都极度延伸时，才是 T 型
-                bool is_t_junction = (ext_left > w * 0.25 && ext_right > w * 0.25);
+                for(int y = 0; y < roi_h; y++) {
+                    if (left_b[y] < w - 1 && right_b[y] > 0) {
+                        max_track_width = std::max(max_track_width, right_b[y] - left_b[y]);
+                    }
+                }
 
-                // 5. 寻找前瞻引导行
+                // 【降维打击分类器：通过膨胀和双向展宽区分 L / T / 岔路】
+                bool is_branched = (max_track_width > w * 0.35); // 赛道物理宽度是否发生剧烈膨胀（排除了普通 L 弯）
+                
+                bool is_wide_left = ((center_seed.x - min_left_x) > w * 0.25);
+                bool is_wide_right = ((max_right_x - center_seed.x) > w * 0.25);
+
                 int target_y = roi_h / 2; 
                 while(target_y < roi_h - 1 && (left_b[target_y] == w - 1 || right_b[target_y] == 0)) {
                     target_y++; 
@@ -203,28 +212,32 @@ private:
                     current_y = center_seed.y;
                 } else {
                     current_y = target_y;
-                    int curr_width = right_b[target_y] - left_b[target_y];
                     
-                    if (is_t_junction) {
-                        // T 型路口：强制靠右转弯
-                        current_x = right_b[target_y] - base_width / 2; 
-                        if (current_x < 0) current_x = right_b[target_y] - 40; 
-                        cv::putText(debug_vis, "T-JUNCTION -> TURN RIGHT", cv::Point(w / 2 - 200, 100), 
-                                    cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(0, 0, 255), 3);
-                    } 
-                    // 【问题2修复】：遇到单侧岔路导致赛道异常变宽，触发“右边缘置信”强行直行！
-                    else if (curr_width > base_width * 1.6) {
-                        current_x = right_b[target_y] - base_width / 2; 
-                        cv::putText(debug_vis, "IGNORE LEFT BRANCH -> GO STRAIGHT", cv::Point(w / 2 - 250, 100), 
-                                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 3);
-                    } 
-                    else {
+                    if (is_branched) {
+                        if (is_wide_left && is_wide_right) {
+                            // T-Junction (双向起飞)
+                            current_x = right_b[target_y] - base_width / 2; 
+                            cv::putText(debug_vis, "T-JUNCTION -> TURN RIGHT", cv::Point(w / 2 - 200, 100), 
+                                        cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(0, 0, 255), 3);
+                        } else if (is_wide_left && !is_wide_right) {
+                            // 仅左岔路 -> 忽略左侧，死咬右边缘直行
+                            current_x = right_b[target_y] - base_width / 2; 
+                            cv::putText(debug_vis, "IGNORE LEFT -> GO STRAIGHT", cv::Point(w / 2 - 250, 100), 
+                                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 3);
+                        } else if (!is_wide_left && is_wide_right) {
+                            // 仅右岔路 (右 T 型) -> 进入右转逻辑
+                            current_x = right_b[target_y] - base_width / 2; 
+                            cv::putText(debug_vis, "RIGHT BRANCH -> TURN RIGHT", cv::Point(w / 2 - 250, 100), 
+                                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 0, 255), 3);
+                        } else {
+                            current_x = (left_b[target_y] + right_b[target_y]) / 2;
+                        }
+                    } else {
                         // 正常的直线或 L 型弯：取赛道中点，平滑巡线
                         current_x = (left_b[target_y] + right_b[target_y]) / 2;
                     }
                 }
 
-                // 输出引导点
                 geometry_msgs::msg::Point p;
                 p.x = static_cast<double>(current_x) / w;
                 p.y = static_cast<double>(current_y + roi_y) / h;
@@ -235,7 +248,6 @@ private:
             }
         } 
         
-        // 注意：上面有一个光斑过滤逻辑，可能会把 is_dead_end 重新变为 true
         if (is_dead_end) {
             cv::putText(debug_vis, "DEAD END", cv::Point(50, 100), cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 0, 255), 3);
         }
