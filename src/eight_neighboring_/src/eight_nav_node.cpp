@@ -38,10 +38,11 @@ public:
         open_ksize_  = declare_parameter<int>("open_ksize", 5);
         border_margin_px_ = declare_parameter<int>("border_margin_px", 0);
 
+        // 保留旧参数防报错
         declare_parameter<int>("window_width", 160); 
         declare_parameter<int>("window_height", 40); 
         declare_parameter<int>("num_windows", 4); 
-        declare_parameter<std::vector<double>>("region_weights", {0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0});
+        declare_parameter<std::vector<double>>("region_weights", {0.0});
         
         show_fps_overlay_ = declare_parameter<bool>("show_fps_overlay", true);
         fps_ema_alpha_    = declare_parameter<double>("fps_ema_alpha", 0.2);
@@ -59,7 +60,7 @@ public:
             image_topic_, rclcpp::SensorDataQoS(),
             std::bind(&EightNavNode::onImage, this, std::placeholders::_1));
 
-        RCLCPP_INFO(get_logger(), "已切换为真正的【八邻域 Moore 边界爬行算法】(BUG修复版)!");
+        RCLCPP_INFO(get_logger(), "八邻域摩尔追踪启动！(加入光斑滤除与岔路识别逻辑)");
     }
 
 private:
@@ -126,19 +127,18 @@ private:
         cv::rectangle(debug_vis, roi_rect, cv::Scalar(255, 255, 0), 2);
 
         // ==========================================
-        // 【全新核心：八邻域 Moore 边界追踪】
+        // 【核心：八邻域 Moore 边界追踪】
         // ==========================================
         
-        // 1. 全局视野死胡同判定 (恢复最稳的方法)
+        // 1. 全局视野死胡同初判
         int total_white_pixels = cv::countNonZero(binary);
         double global_white_ratio = (double)total_white_pixels / (roi_rect.area());
         bool is_dead_end = (global_white_ratio < 0.015); 
 
         cv::Point center_seed(-1, -1);
         if (!is_dead_end) {
-            // 【修复 1】从下往上扫描寻找起步点，避开可能被 mask 变黑的最底层
             int mid_x = w / 2;
-            for (int y = roi_h - 5; y >= 0; y--) { // 从倒数第5行开始往上找
+            for (int y = roi_h - 5; y >= 0; y--) { 
                 for (int x_offset = 0; x_offset < w / 2; x_offset += 2) {
                     if (binary.at<uchar>(y, mid_x + x_offset) > 0) { center_seed = cv::Point(mid_x + x_offset, y); break; }
                     if (binary.at<uchar>(y, mid_x - x_offset) > 0) { center_seed = cv::Point(mid_x - x_offset, y); break; }
@@ -146,92 +146,97 @@ private:
                 if (center_seed.x != -1) break;
             }
         }
-        
-        if (center_seed.x == -1) {
-            is_dead_end = true; // 兜底保护
-        }
+        if (center_seed.x == -1) is_dead_end = true;
 
         int current_x = w / 2;
         int current_y = roi_h / 2; 
 
         if (!is_dead_end) {
-            // 2. 寻找左边界种子和右边界种子
+            // 2. 寻找左右边界种子
             cv::Point left_seed = center_seed;
             while(left_seed.x > 0 && binary.at<uchar>(left_seed.y, left_seed.x - 1) > 0) left_seed.x--;
             
             cv::Point right_seed = center_seed;
             while(right_seed.x < w - 1 && binary.at<uchar>(right_seed.y, right_seed.x + 1) > 0) right_seed.x++;
+            
+            int base_width = std::max(20, right_seed.x - left_seed.x);
 
-            // 3. 放出两只蚂蚁，执行八邻域边界爬行
+            // 3. 蚂蚁出动
             std::vector<cv::Point> left_edge = traceBoundary(binary, left_seed, 4, true);
             std::vector<cv::Point> right_edge = traceBoundary(binary, right_seed, 0, false);
 
-            // 4. 分析爬行轨迹
-            bool hit_left_wall = false;
-            bool hit_right_wall = false;
-            int max_track_width = 0;
-            
-            // 【修复 3】正确初始化并计算左右边界
-            std::vector<int> left_b(roi_h, w - 1); // 默认最右
-            std::vector<int> right_b(roi_h, 0);    // 默认最左
-            
-            for(const auto& p : left_edge) {
-                left_b[p.y] = std::min(left_b[p.y], p.x); // 左边界取最小 x
-                if (p.x <= 5) hit_left_wall = true;
-                cv::circle(debug_vis, cv::Point(p.x, p.y + roi_y), 2, cv::Scalar(0, 0, 255), -1); 
-            }
-            for(const auto& p : right_edge) {
-                right_b[p.y] = std::max(right_b[p.y], p.x); // 右边界取最大 x
-                if (p.x >= w - 6) hit_right_wall = true;
-                cv::circle(debug_vis, cv::Point(p.x, p.y + roi_y), 2, cv::Scalar(255, 0, 0), -1); 
-            }
-
-            for(int y = 0; y < roi_h; y++) {
-                if (left_b[y] < w - 1 && right_b[y] > 0) {
-                    max_track_width = std::max(max_track_width, right_b[y] - left_b[y]);
-                }
-            }
-
-            // 5. 终极路口判定：左右边界都撞墙，且赛道极度变宽 -> 绝对的 T 型路口
-            bool is_t_junction = (hit_left_wall && hit_right_wall && max_track_width > w * 0.6);
-
-            // 6. 计算引导点
-            int target_y = roi_h / 2; // 默认前瞻行
-            // 确保 target_y 这一行是被蚂蚁扫描过的，如果没有就往下退
-            while(target_y < roi_h - 1 && (left_b[target_y] == w - 1 || right_b[target_y] == 0)) {
-                target_y++; 
-            }
-            
-            if (target_y >= roi_h - 1) {
-                // 兜底：如果蚂蚁没爬上去，就指向上一步的种子点
-                current_x = center_seed.x;
-                current_y = center_seed.y;
+            // 【问题3修复】：如果蚂蚁很快就无路可走（总步数太少），说明它是地面的反光孤岛！
+            if (left_edge.size() + right_edge.size() < 80) {
+                is_dead_end = true;
             } else {
-                current_y = target_y;
-                if (is_t_junction) {
-                    // T 型路口 -> 强制向右打方向
-                    int base_width = right_seed.x - left_seed.x;
-                    current_x = right_b[target_y] - base_width / 2; 
-                    if (current_x < 0) current_x = right_b[target_y] - 40; // 兜底
-                    
-                    cv::putText(debug_vis, "T-JUNCTION -> TURN RIGHT", cv::Point(w / 2 - 200, 100), 
-                                cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(0, 0, 255), 3);
-                } else {
-                    // L 型或直道 -> 取中点跟随
-                    current_x = (left_b[target_y] + right_b[target_y]) / 2;
+                // 4. 分析蚂蚁轨迹
+                int min_left_x = w;
+                int max_right_x = 0;
+                std::vector<int> left_b(roi_h, w - 1); 
+                std::vector<int> right_b(roi_h, 0);    
+                
+                for(const auto& p : left_edge) {
+                    left_b[p.y] = std::min(left_b[p.y], p.x); 
+                    min_left_x = std::min(min_left_x, p.x); 
+                    cv::circle(debug_vis, cv::Point(p.x, p.y + roi_y), 2, cv::Scalar(0, 0, 255), -1); 
                 }
+                for(const auto& p : right_edge) {
+                    right_b[p.y] = std::max(right_b[p.y], p.x); 
+                    max_right_x = std::max(max_right_x, p.x); 
+                    cv::circle(debug_vis, cv::Point(p.x, p.y + roi_y), 2, cv::Scalar(255, 0, 0), -1); 
+                }
+
+                // 【问题1修复】：基于起步点的双向展宽判定（完美区分 L 和 T）
+                int ext_left = center_seed.x - min_left_x;
+                int ext_right = max_right_x - center_seed.x;
+                // 只有当向左和向右都极度延伸时，才是 T 型
+                bool is_t_junction = (ext_left > w * 0.25 && ext_right > w * 0.25);
+
+                // 5. 寻找前瞻引导行
+                int target_y = roi_h / 2; 
+                while(target_y < roi_h - 1 && (left_b[target_y] == w - 1 || right_b[target_y] == 0)) {
+                    target_y++; 
+                }
+                
+                if (target_y >= roi_h - 1) {
+                    current_x = center_seed.x;
+                    current_y = center_seed.y;
+                } else {
+                    current_y = target_y;
+                    int curr_width = right_b[target_y] - left_b[target_y];
+                    
+                    if (is_t_junction) {
+                        // T 型路口：强制靠右转弯
+                        current_x = right_b[target_y] - base_width / 2; 
+                        if (current_x < 0) current_x = right_b[target_y] - 40; 
+                        cv::putText(debug_vis, "T-JUNCTION -> TURN RIGHT", cv::Point(w / 2 - 200, 100), 
+                                    cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(0, 0, 255), 3);
+                    } 
+                    // 【问题2修复】：遇到单侧岔路导致赛道异常变宽，触发“右边缘置信”强行直行！
+                    else if (curr_width > base_width * 1.6) {
+                        current_x = right_b[target_y] - base_width / 2; 
+                        cv::putText(debug_vis, "IGNORE LEFT BRANCH -> GO STRAIGHT", cv::Point(w / 2 - 250, 100), 
+                                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 3);
+                    } 
+                    else {
+                        // 正常的直线或 L 型弯：取赛道中点，平滑巡线
+                        current_x = (left_b[target_y] + right_b[target_y]) / 2;
+                    }
+                }
+
+                // 输出引导点
+                geometry_msgs::msg::Point p;
+                p.x = static_cast<double>(current_x) / w;
+                p.y = static_cast<double>(current_y + roi_y) / h;
+                corner_pub_->publish(p);
+
+                cv::drawMarker(debug_vis, cv::Point(current_x, current_y + roi_y), 
+                               cv::Scalar(255, 0, 255), cv::MARKER_CROSS, 30, 3);
             }
-
-            // 发送给下位机
-            geometry_msgs::msg::Point p;
-            p.x = static_cast<double>(current_x) / w;
-            p.y = static_cast<double>(current_y + roi_y) / h;
-            corner_pub_->publish(p);
-
-            // 绘制中心引导十字
-            cv::drawMarker(debug_vis, cv::Point(current_x, current_y + roi_y), 
-                           cv::Scalar(255, 0, 255), cv::MARKER_CROSS, 30, 3);
-        } else {
+        } 
+        
+        // 注意：上面有一个光斑过滤逻辑，可能会把 is_dead_end 重新变为 true
+        if (is_dead_end) {
             cv::putText(debug_vis, "DEAD END", cv::Point(50, 100), cv::FONT_HERSHEY_SIMPLEX, 1.5, cv::Scalar(0, 0, 255), 3);
         }
 
@@ -254,44 +259,34 @@ private:
         return debug_vis;
     }
 
-    // ==========================================
-    // 【核心引擎：纯正摩尔边界追踪器】
-    // ==========================================
     std::vector<cv::Point> traceBoundary(const cv::Mat& bin, cv::Point start, int start_bg_dir, bool clockwise) const {
         std::vector<cv::Point> edge;
         cv::Point curr = start;
         int current_bg_dir = start_bg_dir;
         
-        // 八邻域方向向量 0:右, 1:右下, 2:下, 3:左下, 4:左, 5:左上, 6:上, 7:右上
         const int dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
         const int dy[8] = {0, 1, 1, 1, 0, -1, -1, -1};
         
-        for(int i = 0; i < 2000; i++) { // 最大爬行步数
+        for(int i = 0; i < 2000; i++) { 
             edge.push_back(curr);
             
-            // 撞到上、左、右屏幕边缘即停止
             if (curr.y <= 0 || curr.x <= 0 || curr.x >= bin.cols - 1) break;
-            
-            // 【修复 2】取消对底部的立刻击杀。只有当蚂蚁向上爬了一段距离后，又掉回最底部，才判定为绕圈停止
             if (i > 50 && curr.y >= bin.rows - 1) break;
             
             bool found = false;
-            // 扫描 8 个邻居
             for(int j = 0; j < 8; j++) {
                 int check_dir = clockwise ? (current_bg_dir + j) % 8 : (current_bg_dir - j + 8) % 8;
                 cv::Point p = curr + cv::Point(dx[check_dir], dy[check_dir]);
                 
                 if (p.x < 0 || p.x >= bin.cols || p.y < 0 || p.y >= bin.rows) continue;
                 
-                if (bin.at<uchar>(p) > 0) { // 找到新的白点
-                    // 计算找到白点前的那个黑点（背景点），作为下一步搜索的起点
+                if (bin.at<uchar>(p) > 0) { 
                     int bg_idx_before_found = clockwise ? (check_dir - 1 + 8) % 8 : (check_dir + 1) % 8;
                     cv::Point bg_pixel = curr + cv::Point(dx[bg_idx_before_found], dy[bg_idx_before_found]);
                     
-                    curr = p; // 前进
+                    curr = p; 
                     cv::Point rel_bg = bg_pixel - curr;
                     
-                    // 重新计算背景点相对于新位置的方向
                     for(int k = 0; k < 8; k++) {
                         if(dx[k] == rel_bg.x && dy[k] == rel_bg.y) {
                             current_bg_dir = k; 
@@ -302,7 +297,7 @@ private:
                     break;
                 }
             }
-            if (!found) break; // 变成孤岛了，停止爬行
+            if (!found) break; 
         }
         return edge;
     }
@@ -324,9 +319,9 @@ private:
 
 public:
     void runBatchProcessing() {
-        if (input_video_path_.empty()) { RCLCPP_ERROR(get_logger(), "未指定输入视频路径！"); return; }
+        if (input_video_path_.empty()) return;
         cv::VideoCapture cap(input_video_path_);
-        if (!cap.isOpened()) { RCLCPP_ERROR(get_logger(), "无法打开视频文件"); return; }
+        if (!cap.isOpened()) return;
 
         int width = cap.get(cv::CAP_PROP_FRAME_WIDTH);
         int height = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
@@ -360,7 +355,7 @@ private:
         if (!fps_initialized_) { last_frame_tp_ = now; fps_initialized_ = true; return; }
         std::chrono::duration<double> dt = now - last_frame_tp_;
         last_frame_tp_ = now;
-        if (dt.count() > 1e-6) { fps_value_ = fps_ema_alpha_ * (1.0 / dt.count()) + (1.0 - fps_ema_alpha_) * fps_value_; }
+        if (dt.count() > 1e-6) fps_value_ = fps_ema_alpha_ * (1.0 / dt.count()) + (1.0 - fps_ema_alpha_) * fps_value_; 
     }
 
     std::string image_topic_, corner_topic_, debug_topic_, binary_topic_;
@@ -388,7 +383,8 @@ private:
 int main(int argc, char ** argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<EightNavNode>();
-    bool is_batch; node->get_parameter("batch_mode", is_batch);
+    bool is_batch = false; 
+    node->get_parameter("batch_mode", is_batch);
     if (is_batch) node->runBatchProcessing();
     else rclcpp::spin(node);
     rclcpp::shutdown();
