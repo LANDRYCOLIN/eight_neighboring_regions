@@ -40,22 +40,25 @@ def generate_launch_description():
             
             # --- 降噪与保边 ---
             'blur_ksize': 7,
-            'bilateral_d': 0,       # 设为大于0开启双边滤波，专治地板反光纹理
+            'bilateral_d': 3,       # 设为大于0开启双边滤波，专治地板反光纹理
             
             # --- 形态学流水线 ---
-            'morph_ksize': 7,       # 第一刀：抹掉微小星点
-            'close_ksize': 13,       # 第二刀：补齐光斑导致的线段断裂
-            'open_ksize': 7,        # 第三刀：刮平多余毛刺
+            'morph_ksize': 9,       # 第一刀：抹掉微小星点
+            'close_ksize': 17,       # 第二刀：补齐光斑导致的线段断裂
+            'open_ksize': 11,        # 第三刀：刮平多余毛刺
             
             # --- 边缘物理遮挡 ---
             'border_margin_px': 25,  # 设为 20 即可把赛道边缘杂物物理抹黑
             
             # --- 其他 ---
-            'window_width': 360,    # 足够宽，包住白线
+            'window_width': 375,    # 足够宽，包住白线
             'window_height': 35,    # 足够薄，应对弯道
-            'num_windows': 6,
-            'local_debug_display': True,
-            'region_weights': [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.2, 1.5]
+            'num_windows': 7,
+            'region_weights': [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.2, 1.5],
+            'batch_mode': True,
+            'input_video_path': '/home/causin/eight_neighboring_regions/test.mp4',
+            'output_video_path': '/home/causin/eight_neighboring_regions/debug_render_full.mp4',
+            'local_debug_display': False # 批处理时建议关闭显示以提速
         }]
     )
 

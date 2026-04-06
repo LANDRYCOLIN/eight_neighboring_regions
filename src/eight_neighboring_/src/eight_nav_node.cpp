@@ -50,7 +50,13 @@ public:
         fps_ema_alpha_    = declare_parameter<double>("fps_ema_alpha", 0.2);
         
         // 【核心修改 2：开启原生 OpenCV 显示后门】
-        local_debug_display_ = declare_parameter<bool>("local_debug_display", true); 
+        local_debug_display_ = declare_parameter<bool>("local_debug_display", true);
+        
+        // ======= 新增：从 Launch 获取批处理配置 =======
+        batch_mode_        = declare_parameter<bool>("batch_mode", false);
+        input_video_path_  = declare_parameter<std::string>("input_video_path", "");
+        output_video_path_ = declare_parameter<std::string>("output_video_path", "debug_batch.mp4");
+        // ===========================================
 
         corner_pub_ = create_publisher<geometry_msgs::msg::Point>(corner_topic_, 10);
         debug_pub_  = create_publisher<sensor_msgs::msg::Image>(debug_topic_, 10);
@@ -76,13 +82,13 @@ private:
         }
     }
 
-    void processFrame(const cv::Mat& frame, const std_msgs::msg::Header& header) {
+    cv::Mat processFrame(const cv::Mat& frame, const std_msgs::msg::Header& header) {
         int w = frame.cols;
         int h = frame.rows;
 
         int roi_y = static_cast<int>(h * (1.0 - roi_ratio_));
         int roi_h = h - roi_y;
-        if (roi_y < 0 || roi_h <= 0) return;
+        if (roi_y < 0 || roi_h <= 0) return frame;
         cv::Rect roi_rect(0, roi_y, w, roi_h);
         cv::Mat roi = frame(roi_rect);
 
@@ -153,7 +159,9 @@ private:
             if (window_rect.area() <= 0) break;
 
             cv::Mat window_roi = binary(window_rect);
-            int branches = countTransitions(window_roi);
+            bool hits_side = false;
+            // 传入 15 像素作为防抖阈值，小于 15 像素的毛刺一律不当分支
+            int branches = analyzeTopology(window_roi, hits_side, 15);
 
             cv::Moments M = cv::moments(window_roi, true);
             double white_ratio = M.m00 / window_rect.area(); 
@@ -168,8 +176,15 @@ private:
             // 【新增】默认框是绿色 (B, G, R)
             cv::Scalar box_color(0, 255, 0); 
 
-           // 遇到路口倾向右转 (加入 i > 0 屏蔽底部边界误检)
-            if (branches >= 3 && i > 1) {
+           // ======= 修改判决条件 =======
+            // 现在要判定为路口，必须满足 4 把锁：
+            // 1. 分支 >= 3 (已经防抖)
+            // 2. 不是最底下的头两层锚点 (i > 1)
+            // 3. 白色面积足够大 (white_ratio > 0.15)
+            // 4. 白线必须怼到了窗口的左边或右边 (hits_side)
+            if (branches >= 3 && i > 1 && white_ratio > 0.15 && hits_side) {
+                
+                // --- 权重控制转向逻辑保持不变 ---
                 cv::Mat weighted_roi;
                 window_roi.convertTo(weighted_roi, CV_32F);
 
@@ -245,6 +260,8 @@ private:
             cv::imshow("NATIVE DEBUG VIEW (NO RQT LAG)", debug_vis);
             cv::waitKey(1);
         }
+        
+        return debug_vis; // 新增：返回渲染后的图像
     }
 
     void applyPreFilters(cv::Mat &gray) const {
@@ -260,6 +277,43 @@ private:
                                 std::max(1.0, bilateral_sigma_space_));
             gray = temp;
         }
+    }
+
+    // ======= 新增：脱机逐帧处理逻辑 =======
+public:
+    void runBatchProcessing() {
+        if (input_video_path_.empty()) {
+            RCLCPP_ERROR(get_logger(), "未指定输入视频路径！");
+            return;
+        }
+
+        cv::VideoCapture cap(input_video_path_);
+        if (!cap.isOpened()) {
+            RCLCPP_ERROR(get_logger(), "无法打开视频文件: %s", input_video_path_.c_str());
+            return;
+        }
+
+        int width = cap.get(cv::CAP_PROP_FRAME_WIDTH);
+        int height = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+        double fps = cap.get(cv::CAP_PROP_FPS);
+        
+        cv::VideoWriter writer(output_video_path_, 
+                               cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 
+                               fps, cv::Size(width, height));
+
+        RCLCPP_INFO(get_logger(), "开始批处理: %dx%d @ %.2f FPS", width, height, fps);
+
+        cv::Mat frame;
+        while (rclcpp::ok() && cap.read(frame)) {
+            std_msgs::msg::Header header;
+            header.stamp = this->now();
+            header.frame_id = "batch_frame";
+
+            // 逐帧调用算法，不经过 ROS 话题，绝不丢帧
+            cv::Mat processed = processFrame(frame, header);
+            writer.write(processed);
+        }
+        RCLCPP_INFO(get_logger(), "批处理完成！文件保存至: %s", output_video_path_.c_str());
     }
 
     void applyBorderMask(cv::Mat &mask) const {
@@ -282,17 +336,53 @@ private:
         }
     }
 
-    int countTransitions(const cv::Mat& roi) const {
-        int transitions = 0;
+    // 【核心重构】：具备防抖与侧边检测的拓扑分析器
+    int analyzeTopology(const cv::Mat& roi, bool& hits_side, int min_branch_width = 15) const {
         int w = roi.cols, h = roi.rows;
-        if (w < 2 || h < 2) return 0;
-        int prev = roi.at<uchar>(0, 0);
-        auto check = [&](int val) { if (val != prev) { transitions++; prev = val; } };
-        for (int x = 0; x < w; ++x) check(roi.at<uchar>(0, x));
-        for (int y = 1; y < h; ++y) check(roi.at<uchar>(y, w - 1));
-        for (int x = w - 2; x >= 0; --x) check(roi.at<uchar>(h - 1, x));
-        for (int y = h - 2; y > 0; --y) check(roi.at<uchar>(y, 0));
-        return transitions / 2;
+        if (w < 2 || h < 2) {
+            hits_side = false;
+            return 0;
+        }
+
+        // 1. 提取周长一维数组
+        std::vector<uchar> perimeter;
+        perimeter.reserve(2 * w + 2 * h);
+        for (int x = 0; x < w; ++x) perimeter.push_back(roi.at<uchar>(0, x));
+        for (int y = 1; y < h; ++y) perimeter.push_back(roi.at<uchar>(y, w - 1));
+        for (int x = w - 2; x >= 0; --x) perimeter.push_back(roi.at<uchar>(h - 1, x));
+        for (int y = h - 2; y > 0; --y) perimeter.push_back(roi.at<uchar>(y, 0));
+
+        // 2. 状态机防抖：滤除小于 min_branch_width 的细碎锯齿噪点
+        std::vector<uchar> compressed;
+        int current_color = perimeter[0];
+        int run_length = 0;
+
+        for (uchar p : perimeter) {
+            if (p == current_color) {
+                run_length++;
+            } else {
+                if (run_length >= min_branch_width) {
+                    compressed.push_back(current_color);
+                }
+                current_color = p;
+                run_length = 1;
+            }
+        }
+        if (run_length >= min_branch_width) {
+            compressed.push_back(current_color);
+        }
+
+        // 首尾闭环处理
+        if (compressed.size() > 1 && compressed.front() == compressed.back()) {
+            compressed.pop_back();
+        }
+
+        // 3. 侧边溢出校验：检查窗口极左和极右是否被粗壮白线穿透
+        int left_white = cv::countNonZero(roi.col(0));
+        int right_white = cv::countNonZero(roi.col(w - 1));
+        hits_side = (left_white >= min_branch_width || right_white >= min_branch_width);
+
+        return compressed.size() / 2; // 返回真实的粗壮分支数
     }
 
     void updateRealtimeFps() {
@@ -321,6 +411,12 @@ private:
     bool show_fps_overlay_, fps_initialized_{false}, local_debug_display_;
     std::chrono::steady_clock::time_point last_frame_tp_;
 
+    // ======= 新增：批处理模式相关变量 =======
+    bool batch_mode_;              // 是否开启批处理模式
+    std::string input_video_path_; // 输入原视频路径
+    std::string output_video_path_;// 输出渲染视频路径
+    // =====================================
+
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
     rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr corner_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_pub_;
@@ -329,7 +425,20 @@ private:
 
 int main(int argc, char ** argv) {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<EightNavNode>());
+    auto node = std::make_shared<EightNavNode>();
+
+    // 获取是否开启批处理的参数
+    bool is_batch;
+    node->get_parameter("batch_mode", is_batch);
+
+    if (is_batch) {
+        // 模式 A：离线批处理，处理完即退出
+        node->runBatchProcessing();
+    } else {
+        // 模式 B：在线实时巡线
+        rclcpp::spin(node);
+    }
+
     rclcpp::shutdown();
     return 0;
 }
