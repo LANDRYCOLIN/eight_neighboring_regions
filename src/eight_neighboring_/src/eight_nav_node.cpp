@@ -37,6 +37,9 @@ public:
         close_ksize_ = declare_parameter<int>("close_ksize", 9);
         open_ksize_  = declare_parameter<int>("open_ksize", 5);
         border_margin_px_ = declare_parameter<int>("border_margin_px", 0);
+        enable_bottom_touch_filter_ = declare_parameter<bool>("enable_bottom_touch_filter", true);
+        bottom_touch_check_rows_ = declare_parameter<int>("bottom_touch_check_rows", 10);
+        min_bottom_touch_rows_ = declare_parameter<int>("min_bottom_touch_rows", 2);
 
         // 保留旧参数防报错
         declare_parameter<int>("window_width", 160); 
@@ -149,6 +152,16 @@ private:
 
         int current_x = w / 2;
         int current_y = roi_h / 2; 
+
+        if (!is_dead_end) {
+            cv::Mat component_mask = extractConnectedComponent(binary, center_seed);
+            if (enable_bottom_touch_filter_ &&
+                !hasBottomTouch(component_mask, w, roi_h)) {
+                is_dead_end = true;
+                cv::putText(debug_vis, "NO BOTTOM TOUCH (REFLECTION)", cv::Point(50, 150),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 165, 255), 2);
+            }
+        }
 
         if (!is_dead_end) {
             cv::Point left_seed = center_seed;
@@ -329,6 +342,50 @@ private:
         }
     }
 
+    cv::Mat extractConnectedComponent(const cv::Mat &binary, const cv::Point &seed) const {
+        if (binary.empty() || seed.x < 0 || seed.y < 0 || seed.x >= binary.cols || seed.y >= binary.rows) {
+            return {};
+        }
+        if (binary.at<uchar>(seed) == 0) {
+            return {};
+        }
+
+        cv::Mat labels = binary.clone();
+        cv::floodFill(labels, seed, cv::Scalar(128));
+
+        cv::Mat component_mask;
+        cv::compare(labels, cv::Scalar(128), component_mask, cv::CMP_EQ);
+        return component_mask;
+    }
+
+    bool hasBottomTouch(const cv::Mat &component_mask, int width, int height) const {
+        if (component_mask.empty()) {
+            return false;
+        }
+
+        const int rows_to_check = std::clamp(bottom_touch_check_rows_, 1, height);
+        const int min_touch_rows = std::clamp(min_bottom_touch_rows_, 1, rows_to_check);
+        const int x0 = 0;
+        const int x1 = width - 1;
+
+        int hit_rows = 0;
+        for (int i = 0; i < rows_to_check; ++i) {
+            const int y = height - 1 - i;
+            const uchar *row = component_mask.ptr<uchar>(y);
+            bool hit = false;
+            for (int x = x0; x <= x1; ++x) {
+                if (row[x] > 0) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) {
+                ++hit_rows;
+            }
+        }
+        return hit_rows >= min_touch_rows;
+    }
+
 public:
     void runBatchProcessing() {
         if (input_video_path_.empty()) return;
@@ -377,6 +434,8 @@ private:
     int blur_ksize_, bilateral_d_;
     double bilateral_sigma_color_, bilateral_sigma_space_;
     int morph_ksize_, close_ksize_, open_ksize_, border_margin_px_;
+    bool enable_bottom_touch_filter_;
+    int bottom_touch_check_rows_, min_bottom_touch_rows_;
     
     double fps_ema_alpha_, fps_value_{0.0};
     bool show_fps_overlay_, fps_initialized_{false}, local_debug_display_;

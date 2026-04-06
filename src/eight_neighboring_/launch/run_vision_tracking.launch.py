@@ -16,7 +16,7 @@ def generate_launch_description():
             'fps': 30,
             'fixed_rate_output': False,
             'use_video': True, # 测试视频时改为 True
-            'video_path': '/home/causin/eight_neighboring_regions/test.mp4',
+            'video_path': 'test.mp4',
             'frame_id': 'camera_frame',
             'image_topic': '/camera/image_raw',
             'pixel_format': 'MJPG'
@@ -49,6 +49,11 @@ def generate_launch_description():
             
             # --- 边缘物理遮挡 ---
             'border_margin_px': 25,  # 设为 20 即可把赛道边缘杂物物理抹黑
+
+            # --- 底部触达过滤 ---
+            'enable_bottom_touch_filter': True, 
+            'bottom_touch_check_rows': 30, 
+            'min_bottom_touch_rows': 2,   
             
             # --- 其他 ---
             'window_width': 375,    # 足够宽，包住白线
@@ -56,8 +61,8 @@ def generate_launch_description():
             'num_windows': 7,
             'region_weights': [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.2, 1.5],
             'batch_mode': True,
-            'input_video_path': '/home/causin/eight_neighboring_regions/test.mp4',
-            'output_video_path': '/home/causin/eight_neighboring_regions/debug_render_full.mp4',
+            'input_video_path': 'test.mp4',
+            'output_video_path': 'debug_render_full.mp4',
             'local_debug_display': False # 批处理时建议关闭显示以提速
         }]
     )
